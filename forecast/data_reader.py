@@ -16,7 +16,7 @@
 # Functions to read data into an XArray
 import numpy as np
 import xarray as xr
-import xesmf as xe
+#import xesmf as xe
 import datetime
 from forecast.forecast_variables import DERIVED_VARIABLES
 from forecast.cache_manager import CacheManager

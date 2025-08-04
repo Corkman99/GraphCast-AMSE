@@ -180,7 +180,7 @@ class Predictor(predictor_base.Predictor):
 
       # Add constant inputs:
       all_inputs = xarray.merge([constant_inputs, inputs])
-      predictions: xarray.Dataset = self._predictor(
+      predictions: xarray.Dataset = self._predictor( # this calls normalization.predictor
           all_inputs, target_template,
           forcings=forcings,
           **kwargs)
