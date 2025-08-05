@@ -2,8 +2,10 @@ import os
 import xarray as xr
 from typing import Tuple
 import dataclasses
+import optax
 
 from graphcast.graphcast import TaskConfig
+from config import OptimizationConfig
 
 
 def load_stats(path: str) -> Tuple[xr.Dataset, xr.Dataset, xr.Dataset]:
@@ -32,3 +34,14 @@ def extract_extended_inputs_targets_forcings(
         targets_template=targets, required_num_steps=leadtime
     )
     return inputs, targets, forcings
+
+
+def get_optimizer(
+    optim_param: OptimizationConfig,
+) -> optax.GradientTransformationExtraArgs:
+    if optim_param.optimizer == "adam":
+        return optax.adam(learning_rate=optim_param.learning_rate)
+    elif optim_param.optimizer == "sgd":
+        return optax.sgd(learning_rate=optim_param.learning_rate)
+    else:
+        raise ValueError(f"Unsupported optimizer: {optim_param.optimizer}")

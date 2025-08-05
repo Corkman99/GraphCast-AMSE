@@ -283,3 +283,26 @@ def build_GEG_loss_and_grad(
         loss_wrapper,
         grad_wrapper,
     )
+
+
+STATIC_VARIABLES = [
+    "land_sea_mask",
+    "geopotential_at_surface",
+    "toa_incident_solar_radiation",
+    "year_progress_cos",
+    "year_progress_sin",
+    "day_progress_sin",
+    "day_progress_cos",
+]
+
+
+# Type should be optax.Updates, but doesn't have [] function
+def zero_static_variable_updates(updates):
+    import jax.tree_util
+    import jax.numpy
+
+    for var in STATIC_VARIABLES:
+        updates[var] = jax.tree_util.tree_map(
+            lambda x: jax.numpy.zeros_like(x), updates[var]
+        )
+    return updates
