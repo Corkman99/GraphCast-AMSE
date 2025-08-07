@@ -31,7 +31,7 @@ class OptimizationConfig(BaseModel):
     num_epochs: int = 10
     optimizer: str = "adam"
     learning_rate: float = 1e-3
-    loss_function: Callable
+    loss_function: Optional[Callable]
 
 
 class ExperimentConfig(BaseModel):
@@ -48,7 +48,7 @@ class ExperimentConfig(BaseModel):
 
 def default_experiment_config() -> ExperimentConfig:
     import os
-    from trainer.loss_utils import make_amse_loss
+    from trainer.loss_utils import make_amse_loss, make_loss_new
 
     home = os.path.expanduser("~")
 
@@ -68,9 +68,9 @@ def default_experiment_config() -> ExperimentConfig:
             home,
             "scratch/Data/GraphCast_OP/custom-hres_2022-09-26_res-0.25_levels-13_steps-16.nc",
         ),
-        leadtime=14,
+        leadtime=2,
         reference_path=None,  # TODO: use input_path only to search for two input states, reference path has forecast
-        output_path=os.path.join(home, "scratch/GraphCast-OP_TC_5day/AMSE/"),
+        output_path=os.path.join(home, "scratch/GraphCast-OP_TC_5day/AMSE-Optim/"),
     )
 
     PVW = {
@@ -78,18 +78,19 @@ def default_experiment_config() -> ExperimentConfig:
         "10m_u_component_of_wind": 0.1,
         "10m_v_component_of_wind": 0.1,
         "mean_sea_level_pressure": 0.1,
-        "total_precipitation_6hr": 0.1,
+        "total_precipitation_6hr": 0.0,
     }
 
     custom_loss = make_amse_loss(
         model.checkpoint_path,
         model.stats_path,
         per_variable_weights=PVW,
-        compute_wind_speed=True,
+        compute_wind_speed=False,
     )
+    custom_loss = None
 
     optim = OptimizationConfig(
-        num_epochs=10, optimizer="adam", learning_rate=1e-3, loss_function=custom_loss
+        num_epochs=2, optimizer="adam", learning_rate=1e-3, loss_function=custom_loss
     )
 
     return ExperimentConfig(compute=compute, model=model, data=data, optimization=optim)

@@ -5,6 +5,7 @@ import xarray
 
 from graphcast import predictor_base
 from graphcast import xarray_tree
+from graphcast import rollout
 from config import ComputeConfig, OptimizationConfig
 
 
@@ -63,9 +64,9 @@ def _unnormalize(
 class NormalizedInputsAndResiduals(predictor_base.Predictor):
     """
     Class to replace graphcast.normalization.InputsAndResiduals wrapper
-    We assume instead normalized inputs and forcings, such that we are taking
-    the gradient of the loss wrt to normalized inputs. The optimization loop can then
-    be run in normalized space.
+    We assume normalized inputs and forcings, such that we are taking
+    the gradient of the loss wrt to normalized inputs. The optimization loop
+    then runs in normalized space.
     """
 
     def __init__(
@@ -82,36 +83,48 @@ class NormalizedInputsAndResiduals(predictor_base.Predictor):
         self._residual_locations = None
 
     def _add_input_in_unnormalized_space(self, norm_inputs, norm_prediction):
+        # norm_inputs is a Dataset
+        # norm_prediction is a Dataarray
         if norm_prediction.sizes.get("time") != 1:
             raise ValueError(
                 "normalization.InputsAndResiduals only supports predicting a "
                 "single timestep."
             )
         if norm_prediction.name in norm_inputs:
-            last_input = norm_inputs[norm_prediction.name].isel(time=-1)
-            unnormalized_last_input = _unnormalize(
-                last_input, self._scales, self._locations
+            # We predict a normalized residual.
+            last_input = norm_inputs[norm_prediction.name].isel(time=-1)  # normalized
+            unnormalized_last_input = (
+                _unnormalize(  # last input is non-residual, apply normal stats
+                    last_input, self._scales, self._locations
+                )
             )
-            unnormalized_prediction = _unnormalize(
-                norm_prediction, self._scales, self._locations
+            unnormalized_prediction = (
+                _unnormalize(  # prediction is a residual, so apply residual stats
+                    norm_prediction, self._residual_scales, self._residual_locations
+                )
             )
             unnormalized_prediction += unnormalized_last_input
             return _normalize(unnormalized_prediction, self._scales, self._locations)
         else:
             # A predicted variable which is not an input variable. We are predicting
-            # it directly, so unnormalize it directly to the target scale/location:
+            # it directly (not a residual from prev_step), so just return it
             return norm_prediction
 
     def _subtract_input_and_normalize_target(self, inputs, target):
+        # for loss computation
+        # target is given unnormalized, so this calculates the
+        # normalized residual
         if target.sizes.get("time") != 1:
             raise ValueError(
                 "normalization.InputsAndResiduals only supports wrapping predictors"
                 "that predict a single timestep."
             )
         if target.name in inputs:
-            target_residual = target
-            last_input = inputs[target.name].isel(time=-1)
-            target_residual -= last_input
+            normalized_last_input = inputs[target.name].isel(time=-1)
+            unnormalized_last_input = _unnormalize(
+                normalized_last_input, self._scales, self._locations
+            )
+            target_residual = target - unnormalized_last_input
             return _normalize(
                 target_residual, self._residual_scales, self._residual_locations
             )
@@ -127,12 +140,13 @@ class NormalizedInputsAndResiduals(predictor_base.Predictor):
     ) -> xarray.Dataset:
         # norm_inputs = normalize(inputs, self._scales, self._locations)
         # norm_forcings = normalize(forcings, self._scales, self._locations)
-        norm_predictions = self._predictor(
+        res_norm_predictions = self._predictor(
             inputs, targets_template, forcings=forcings, **kwargs
         )
+
         return xarray_tree.map_structure(
             lambda pred: self._add_input_in_unnormalized_space(inputs, pred),
-            norm_predictions,
+            res_norm_predictions,
         )
 
     def loss(
@@ -185,7 +199,7 @@ def build_GEG_loss_and_grad(
     stddev_by_level,
 ):
     import jax
-    import haiku as hk
+    import haiku
     from graphcast import (
         graphcast,
         casting,
@@ -216,7 +230,12 @@ def build_GEG_loss_and_grad(
 
         return predictor
 
-    @hk.transform_with_state
+    @haiku.transform_with_state
+    def run_forward(model_config, task_config, inputs, targets_template, forcings):
+        predictor = construct_wrapped_graphcast(model_config, task_config)
+        return predictor(inputs, targets_template=targets_template, forcings=forcings)
+
+    @haiku.transform_with_state
     def loss_fn(model_config, task_config, inputs, targets, forcings):
         predictor = construct_wrapped_graphcast(model_config, task_config)
         if optimization_config.loss_function is not None:
@@ -245,21 +264,33 @@ def build_GEG_loss_and_grad(
             return loss, (diagnostics, next_state)
 
         (loss, (diagnostics, next_state)), grads = jax.value_and_grad(
-            _aux, has_aux=True, argnums=4  # wrt inputs
+            _aux, argnums=2, has_aux=True  # wrt inputs
         )(params, state, inputs, targets, forcings)
         return loss, diagnostics, next_state, grads
 
     def with_configs(fn):
         return functools.partial(fn, model_config=model_config, task_config=task_config)
 
-    # def with_params(fn):
-    #     return functools.partial(fn, params=params, state=state)
-
-    # def drop_state(fn)
-    #     return lambda **kw: fn(**kw)[0]
-
+    jit_run = jax.jit(with_configs(run_forward.apply))
     jit_loss = jax.jit(with_configs(loss_fn.apply))
     jit_grad = jax.jit(with_configs(grads_fn))
+
+    def run_wrapper(params, inputs, targets_template, forcings):
+        state = {}
+
+        def _with_params(fn):
+            return functools.partial(fn, params=params, state=state)
+
+        def _drop_state(fn):
+            return lambda **kw: fn(**kw)[0]
+
+        run_forward = _drop_state(_with_params(jit_run))
+        return run_forward(
+            inputs=inputs,
+            targets_template=targets_template,
+            forcings=forcings,
+            rng=jax.random.PRNGKey(compute_config.random_seed),
+        )
 
     def loss_wrapper(params, inputs, targets, forcings):
         ((loss, diagnostics), _) = jit_loss(
@@ -279,7 +310,7 @@ def build_GEG_loss_and_grad(
         return (loss, diagnostics, grad)
 
     return (
-        construct_wrapped_graphcast(model_config, task_config),
+        run_wrapper,
         loss_wrapper,
         grad_wrapper,
     )
@@ -306,3 +337,32 @@ def zero_static_variable_updates(updates):
             lambda x: jax.numpy.zeros_like(x), updates[var]
         )
     return updates
+
+
+# function given an update object that computes the mean, max and min for each variable
+# averaged over lat, lon, and possibily level
+def compute_update_statistics(updates):
+    import jax.numpy
+    from graphcast import xarray_jax
+
+    _updates = xarray_jax.unwrap_vars(updates)
+    stats = {}
+    for var in _updates:
+        if var not in STATIC_VARIABLES:
+            data = _updates[var]
+            stats[var] = {
+                "mean": jax.numpy.mean(data),
+                "max": jax.numpy.max(data),
+                "min": jax.numpy.min(data),
+            }
+    return stats
+
+
+# function that expects output of compute_update_statistics and prints the statistics
+# in a human-readable format
+def print_update_statistics(stats):
+    for var, stat in stats.items():
+        print(
+            f"{var}: mean={stat['mean']:.4f}, max={stat['max']:.4f}, min={stat['min']:.4f}"
+        )
+        print("")
